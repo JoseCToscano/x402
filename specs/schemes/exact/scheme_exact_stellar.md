@@ -138,6 +138,8 @@ A facilitator verifying an `exact` scheme on Stellar MUST enforce all of the fol
 - The facilitator MUST NOT be the `from` address in the transfer.
 - The facilitator address MUST NOT appear in any authorization entries.
 - The simulation MUST emit events showing only the expected balance changes (recipient increase, payer decrease), and NO OTHER BALANCE CHANGES.
+- Contract events whose first topic is `transfer`, `mint`, `burn`, `clawback`, `approve`, or `set_authorized` (compared case-insensitively, except the payment `transfer` which MUST be the exact symbol `transfer`) are balance-moving. The facilitator MUST reject every balance-moving event other than the single expected `transfer` of `requirements.asset`.
+- A facilitator MAY accept other contract events only when the operator configures an allowlist of policy contract ids. An allowlisted event MUST NOT use a balance-moving topic. If the operator also configures a topic allowlist, the event's first topic MUST be one of those symbols. Events from `requirements.asset` that are not the expected transfer MUST still be rejected. With no allowlist configured, every contract event MUST be that transfer.
 
 These checks prevent the fee payer from being tricked into transferring their own funds or sponsoring unintended actions.
 
@@ -160,6 +162,15 @@ In the sponsored flow (`areFeesSponsored: true`), the facilitator fully controls
 ### Safety ceiling: `maxTransactionFeeStroops`
 
 Facilitator implementations MAY expose a `maxTransactionFeeStroops` configuration as a safety ceiling / circuit breaker (default: **50,000 stroops**, operator-overridable). If the simulation-derived settlement fee exceeds this ceiling, the facilitator MUST reject verification with `invalid_exact_stellar_payload_fee_exceeds_maximum`. This is not a per-transaction budget knob; normal transfers should fall well below the default ceiling.
+
+The 50,000 stroop default excludes a Soroban smart account whose `__check_auth` calls another contract. Implementations MAY offer opt-in profiles whose caps were measured from those simulations, without changing the default:
+
+- `warm`: **500,000** stroops. Above the 324,039 stroop settlement fee in [#3515](https://github.com/x402-foundation/x402/issues/3515).
+- `cold`: **6,500,000** stroops. Above a first-touch TTL extension, which spends more of the facilitator's XLM, so it MUST be selected explicitly.
+
+An explicit `maxTransactionFeeStroops` replaces the selected profile cap. The settlement fee is still `minResourceFee + inclusionBuffer`; the profile only changes the circuit breaker. Implementations MUST NOT set the ceiling equal to the fee under check. That removes the circuit breaker.
+
+Facilitators SHOULD publish the active `maxTransactionFeeStroops` on the supported kind `extra` so a client can compare a simulated fee before it is refused. When a profile or policy-event allowlist is configured, that `extra` SHOULD also include `feeProfile`, `policyEventContracts`, and `policyEventTopics`. These fields describe the facilitator. They are not copied into `PaymentRequirements`.
 
 ## Settlement Logic
 

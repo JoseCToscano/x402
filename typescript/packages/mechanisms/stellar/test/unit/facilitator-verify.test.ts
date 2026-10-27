@@ -17,6 +17,7 @@ import {
 import { Api } from "@stellar/stellar-sdk/rpc";
 import { beforeEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { STELLAR_TESTNET_CAIP2 } from "../../src/constants";
+import { DEFAULT_MAX_TRANSACTION_FEE_STROOPS } from "../../src/exact/facilitator/policy";
 import {
   ExactStellarScheme,
   invalidVerifyResponse,
@@ -1173,6 +1174,261 @@ describe("ExactStellarScheme#Verify (randomly using 1-2 facilitator signers)", (
         const result = await facilitator.verify(validPayload, validRequirements);
         expect(result.isValid).toBe(true);
       });
+    });
+  });
+
+  describe("smart-account policy events and fee profiles", () => {
+    const policyContract = Address.contract(Buffer.alloc(32, 7));
+    const policyId = policyContract.toString();
+    const policyHash = policyContract.toScAddress().contractId();
+    const assetHash = () => new Address(ASSET).toScAddress().contractId();
+    const observedWarmSettlement = 324_039;
+    const measuredColdSettlement = 5_710_000;
+
+    const mockSimulation = (events: xdr.DiagnosticEvent[], minResourceFee = "100") => {
+      vi.mocked(mockServer.simulateTransaction).mockResolvedValueOnce({
+        id: "test",
+        latestLedger: 123,
+        events,
+        _parsed: true,
+        transactionData: new SorobanDataBuilder(),
+        minResourceFee,
+        cost: { cpuInsns: "0", memBytes: "0" },
+        results: [],
+      } as Api.SimulateTransactionSuccessResponse);
+    };
+
+    const transferEvent = () =>
+      createMockContractEvent({
+        from: CLIENT_PUBLIC,
+        to: TRANSACTION_RECIPIENT,
+        amount: BigInt(validRequirements.amount),
+        contractId: assetHash(),
+      });
+
+    const symbolEvent = (symbol: string, contractId: xdr.Hash | null) =>
+      createMockDiagnosticEvent(
+        new xdr.ContractEventV0({
+          topics: [xdr.ScVal.scvSymbol(symbol)],
+          data: xdr.ScVal.scvVoid(),
+        }),
+        xdr.ContractEventType.contract(),
+        contractId,
+      );
+
+    it("still rejects a policy event when no allowlist is configured", async () => {
+      mockSimulation([symbolEvent("spending_limit_enforced", policyHash), transferEvent()]);
+
+      const result = await facilitator.verify(validPayload, validRequirements);
+      expect(result.invalidReason).toBe("invalid_exact_stellar_payload_event_not_transfer");
+    });
+
+    it("accepts an allowlisted policy event before or after the transfer", async () => {
+      const scheme = new ExactStellarScheme(facilitatorSigners, {
+        maxTransactionFeeStroops: 1_000_000,
+        policyContracts: [policyId],
+      });
+
+      for (const events of [
+        [symbolEvent("spending_limit_enforced", policyHash), transferEvent()],
+        [transferEvent(), symbolEvent("simple_enforced", policyHash)],
+      ]) {
+        mockSimulation(events);
+        expect(await scheme.verify(validPayload, validRequirements)).toEqual(
+          validVerifyResponse(CLIENT_PUBLIC),
+        );
+      }
+    });
+
+    it("requires the topic allowlist when one is configured", async () => {
+      const scheme = new ExactStellarScheme(facilitatorSigners, {
+        maxTransactionFeeStroops: 1_000_000,
+        policyContracts: [policyId],
+        policyEventTopics: ["spending_limit_enforced"],
+      });
+
+      mockSimulation([symbolEvent("spending_limit_enforced", policyHash), transferEvent()]);
+      expect(await scheme.verify(validPayload, validRequirements)).toEqual(
+        validVerifyResponse(CLIENT_PUBLIC),
+      );
+
+      mockSimulation([symbolEvent("simple_enforced", policyHash), transferEvent()]);
+      const rejected = await scheme.verify(validPayload, validRequirements);
+      expect(rejected.invalidReason).toBe("invalid_exact_stellar_payload_rejected_event");
+      expect(rejected.invalidMessage).toContain("topic_not_allowlisted");
+    });
+
+    it.each(["mint", "burn", "clawback", "approve", "set_authorized", "Mint"])(
+      "rejects balance-moving %s from an allowlisted policy contract",
+      async symbol => {
+        const scheme = new ExactStellarScheme(facilitatorSigners, {
+          maxTransactionFeeStroops: 1_000_000,
+          policyContracts: [policyId],
+          policyEventTopics: ["spending_limit_enforced"],
+        });
+        mockSimulation([symbolEvent(symbol, policyHash), transferEvent()]);
+
+        const result = await scheme.verify(validPayload, validRequirements);
+        expect(result.invalidReason).toBe("invalid_exact_stellar_payload_rejected_event");
+        expect(result.invalidMessage).toContain("balance_moving_topic");
+        expect(result.payer).toBe(CLIENT_PUBLIC);
+      },
+    );
+
+    it("rejects a transfer emitted by the policy contract", async () => {
+      const scheme = new ExactStellarScheme(facilitatorSigners, {
+        maxTransactionFeeStroops: 1_000_000,
+        policyContracts: [policyId],
+      });
+      mockSimulation([
+        createMockContractEvent({
+          from: CLIENT_PUBLIC,
+          to: TRANSACTION_RECIPIENT,
+          amount: BigInt(validRequirements.amount),
+          contractId: policyHash,
+        }),
+      ]);
+
+      const result = await scheme.verify(validPayload, validRequirements);
+      expect(result.invalidReason).toBe("invalid_exact_stellar_payload_event_wrong_asset");
+    });
+
+    it("rejects an informational event from the payment asset", async () => {
+      const scheme = new ExactStellarScheme(facilitatorSigners, {
+        maxTransactionFeeStroops: 1_000_000,
+        policyContracts: [policyId, ASSET],
+      });
+      mockSimulation([symbolEvent("spending_limit_enforced", assetHash()), transferEvent()]);
+
+      const result = await scheme.verify(validPayload, validRequirements);
+      expect(result.invalidReason).toBe("invalid_exact_stellar_payload_rejected_event");
+      expect(result.invalidMessage).toContain("unexpected_asset_event");
+    });
+
+    it("rejects a policy event from a contract that is not allowlisted", async () => {
+      const other = Address.contract(Buffer.alloc(32, 9)).toString();
+      const scheme = new ExactStellarScheme(facilitatorSigners, {
+        maxTransactionFeeStroops: 1_000_000,
+        policyContracts: [other],
+      });
+      mockSimulation([symbolEvent("spending_limit_enforced", policyHash), transferEvent()]);
+
+      const result = await scheme.verify(validPayload, validRequirements);
+      expect(result.invalidReason).toBe("invalid_exact_stellar_payload_rejected_event");
+      expect(result.invalidMessage).toContain("emitter_not_allowlisted");
+    });
+
+    it("rejects a non-symbol policy topic unless the topic allowlist is empty", async () => {
+      const open = new ExactStellarScheme(facilitatorSigners, {
+        maxTransactionFeeStroops: 1_000_000,
+        policyContracts: [policyId],
+      });
+      const filtered = new ExactStellarScheme(facilitatorSigners, {
+        maxTransactionFeeStroops: 1_000_000,
+        policyContracts: [policyId],
+        policyEventTopics: ["spending_limit_enforced"],
+      });
+      const event = createMockDiagnosticEvent(
+        new xdr.ContractEventV0({
+          topics: [xdr.ScVal.scvString("policy")],
+          data: xdr.ScVal.scvVoid(),
+        }),
+        xdr.ContractEventType.contract(),
+        policyHash,
+      );
+
+      mockSimulation([event, transferEvent()]);
+      expect(await open.verify(validPayload, validRequirements)).toEqual(
+        validVerifyResponse(CLIENT_PUBLIC),
+      );
+
+      mockSimulation([event, transferEvent()]);
+      const rejected = await filtered.verify(validPayload, validRequirements);
+      expect(rejected.invalidMessage).toContain("topic_not_allowlisted");
+    });
+
+    it("still requires exactly one matching transfer after policy events are skipped", async () => {
+      const scheme = new ExactStellarScheme(facilitatorSigners, {
+        maxTransactionFeeStroops: 1_000_000,
+        policyContracts: [policyId],
+      });
+
+      mockSimulation([symbolEvent("spending_limit_enforced", policyHash)]);
+      expect((await scheme.verify(validPayload, validRequirements)).invalidReason).toBe(
+        "invalid_exact_stellar_payload_no_transfer_events",
+      );
+
+      mockSimulation([
+        symbolEvent("spending_limit_enforced", policyHash),
+        transferEvent(),
+        transferEvent(),
+      ]);
+      expect((await scheme.verify(validPayload, validRequirements)).invalidReason).toBe(
+        "invalid_exact_stellar_payload_multiple_transfers",
+      );
+    });
+
+    it("rejects a policy event that has no contract id", async () => {
+      const scheme = new ExactStellarScheme(facilitatorSigners, {
+        maxTransactionFeeStroops: 1_000_000,
+        policyContracts: [policyId],
+      });
+      mockSimulation([symbolEvent("spending_limit_enforced", null), transferEvent()]);
+
+      const result = await scheme.verify(validPayload, validRequirements);
+      expect(result.invalidReason).toBe("invalid_exact_stellar_payload_event_missing_contract_id");
+    });
+
+    it("keeps rejecting the measured smart-account fee at the default ceiling", async () => {
+      const scheme = new ExactStellarScheme(facilitatorSigners);
+      mockSimulation([transferEvent()], String(observedWarmSettlement - 100));
+
+      const result = await scheme.verify(validPayload, validRequirements);
+      expect(result).toEqual(
+        invalidVerifyResponse(
+          "invalid_exact_stellar_payload_fee_exceeds_maximum",
+          CLIENT_PUBLIC,
+          `simulation-derived fee ${observedWarmSettlement} stroops exceeds ceiling ${DEFAULT_MAX_TRANSACTION_FEE_STROOPS} stroops`,
+        ),
+      );
+    });
+
+    it("accepts that warm fee on the warm profile and the cold fee only on the cold profile", async () => {
+      const warm = new ExactStellarScheme(facilitatorSigners, { feeProfile: "warm" });
+      const cold = new ExactStellarScheme(facilitatorSigners, { feeProfile: "cold" });
+
+      mockSimulation(
+        [symbolEvent("spending_limit_enforced", policyHash), transferEvent()],
+        String(observedWarmSettlement - 100),
+      );
+      expect(
+        await new ExactStellarScheme(facilitatorSigners, {
+          feeProfile: "warm",
+          policyContracts: [policyId],
+        }).verify(validPayload, validRequirements),
+      ).toEqual(validVerifyResponse(CLIENT_PUBLIC));
+
+      mockSimulation([transferEvent()], String(measuredColdSettlement - 100));
+      expect((await warm.verify(validPayload, validRequirements)).invalidReason).toBe(
+        "invalid_exact_stellar_payload_fee_exceeds_maximum",
+      );
+
+      mockSimulation([transferEvent()], String(measuredColdSettlement - 100));
+      expect(await cold.verify(validPayload, validRequirements)).toEqual(
+        validVerifyResponse(CLIENT_PUBLIC),
+      );
+    });
+
+    it("lets maxTransactionFeeStroops replace the warm cap", async () => {
+      const scheme = new ExactStellarScheme(facilitatorSigners, {
+        feeProfile: "warm",
+        maxTransactionFeeStroops: 100_000,
+      });
+      mockSimulation([transferEvent()], String(observedWarmSettlement - 100));
+
+      const result = await scheme.verify(validPayload, validRequirements);
+      expect(result.invalidReason).toBe("invalid_exact_stellar_payload_fee_exceeds_maximum");
+      expect(result.invalidMessage).toContain("exceeds ceiling 100000 stroops");
     });
   });
 
