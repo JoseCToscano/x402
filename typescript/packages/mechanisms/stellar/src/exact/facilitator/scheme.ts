@@ -11,6 +11,13 @@ import {
   BASE_FEE,
 } from "@stellar/stellar-sdk";
 import { Api } from "@stellar/stellar-sdk/rpc";
+import {
+  gatePolicyContractEvent,
+  normalizePolicyContracts,
+  normalizePolicyEventTopics,
+  resolveStellarFeeCeiling,
+  type StellarFeeProfileName,
+} from "./policy";
 import { STELLAR_WILDCARD_CAIP2 } from "../../constants";
 import { gatherAuthEntrySignatureStatus, getAddressCredentials } from "../../shared";
 import { ExactStellarPayloadV2 } from "../../types";
@@ -33,7 +40,6 @@ import type {
 
 const DEFAULT_TIMEOUT_SECONDS = 60;
 const SUPPORTED_X402_VERSION = 2;
-const DEFAULT_MAX_TRANSACTION_FEE_STROOPS = 50_000;
 const SIGNATURE_EXPIRATION_LEDGER_TOLERANCE = 2;
 
 /**
@@ -90,10 +96,18 @@ export class ExactStellarScheme implements SchemeNetworkFacilitator {
   public readonly areFeesSponsored: boolean;
   public readonly rpcConfig?: RpcConfig;
   public readonly maxTransactionFeeStroops: number;
+  /** Set when the operator opts into a warm or cold smart-account fee profile. */
+  public readonly feeProfile?: StellarFeeProfileName;
   public readonly inclusionFeeStroops: number;
+  /** Policy contracts whose non-balance-moving events may accompany the transfer. */
+  public readonly policyContracts: readonly string[];
+  /** Empty means any non-balance-moving topic from `policyContracts` is accepted. */
+  public readonly policyEventTopics: readonly string[];
   public readonly feeBumpSigner?: FacilitatorStellarSigner;
   private readonly signerMap: Map<string, FacilitatorStellarSigner>;
   private readonly selectSigner: (addresses: readonly string[]) => string;
+  private readonly policyContractSet: ReadonlySet<string>;
+  private readonly policyEventTopicSet: ReadonlySet<string>;
   /**
    * Addresses the facilitator-safety checks must treat as facilitator-controlled.
    * Deliberately a separate set from `signingAddresses`: that set also backs
@@ -112,7 +126,12 @@ export class ExactStellarScheme implements SchemeNetworkFacilitator {
    * @param options.areFeesSponsored - Indicates if fees are sponsored (default: true). The spec
    *   currently only supports `true`; setting `false` here still constructs successfully, but the
    *   official client rejects any payment built against the resulting `areFeesSponsored: false`.
-   * @param options.maxTransactionFeeStroops - Safety ceiling in stroops; verify rejects if the simulation-derived fee exceeds this (default: 50_000)
+   * @param options.maxTransactionFeeStroops - Safety ceiling in stroops; verify rejects if the simulation-derived fee exceeds this (default: 50_000). Replaces the fee-profile cap when both are set.
+   * @param options.feeProfile - Opt-in smart-account ceiling. `warm` is 500_000 stroops and `cold` is 6_500_000. Omit to keep the 50_000 default.
+   * @param options.warmCapStroops - Replaces the warm profile cap
+   * @param options.coldCapStroops - Replaces the cold profile cap
+   * @param options.policyContracts - Contract ids allowed to emit non-balance-moving events. Empty keeps the strict transfer-only scan.
+   * @param options.policyEventTopics - Optional topic allowlist for `policyContracts`. Empty accepts any non-balance-moving topic. Balance-moving topics are rejected.
    * @param options.inclusionFeeStroops - Inclusion fee bid in stroops for the settlement transaction and the fee bump, on top of the resource fee (default: 100).
    *   Mainnet often needs more than the minimum for Soroban transactions to be included.
    * @param options.selectSigner - Callback to select which signer to use (default: round-robin)
@@ -126,7 +145,12 @@ export class ExactStellarScheme implements SchemeNetworkFacilitator {
     {
       rpcConfig,
       areFeesSponsored = true,
-      maxTransactionFeeStroops = DEFAULT_MAX_TRANSACTION_FEE_STROOPS,
+      maxTransactionFeeStroops,
+      feeProfile,
+      warmCapStroops,
+      coldCapStroops,
+      policyContracts,
+      policyEventTopics,
       inclusionFeeStroops = Number(BASE_FEE),
       selectSigner = roundRobinSelectSigner(),
       feeBumpSigner,
@@ -135,8 +159,18 @@ export class ExactStellarScheme implements SchemeNetworkFacilitator {
       rpcConfig?: RpcConfig;
       /** Indicates if fees are sponsored (default: true). See the constructor's own @param doc above: `false` is accepted here but not yet usable end-to-end. */
       areFeesSponsored?: boolean;
-      /** Safety ceiling in stroops; verify rejects if the simulation-derived fee exceeds this (default: 50_000) */
+      /** Safety ceiling in stroops. Replaces the fee-profile cap when set. Default: 50_000. */
       maxTransactionFeeStroops?: number;
+      /** Opt-in `warm` (500_000) or `cold` (6_500_000) smart-account ceiling. */
+      feeProfile?: StellarFeeProfileName;
+      /** Replaces the warm profile cap, in stroops. */
+      warmCapStroops?: number;
+      /** Replaces the cold profile cap, in stroops. */
+      coldCapStroops?: number;
+      /** Contract ids allowed to emit non-balance-moving events. */
+      policyContracts?: readonly string[];
+      /** Topic allowlist for `policyContracts`. Empty accepts any non-balance-moving topic. */
+      policyEventTopics?: readonly string[];
       /** Inclusion fee bid in stroops for the settlement transaction and the fee bump (default: 100) */
       inclusionFeeStroops?: number;
       /** Optional callback to select which signer to use. Receives addresses array, returns selected address. Defaults to round-robin. */
@@ -155,7 +189,18 @@ export class ExactStellarScheme implements SchemeNetworkFacilitator {
     // Apply configuration options (with defaults)
     this.rpcConfig = rpcConfig;
     this.areFeesSponsored = areFeesSponsored ?? true;
-    this.maxTransactionFeeStroops = maxTransactionFeeStroops ?? DEFAULT_MAX_TRANSACTION_FEE_STROOPS;
+    const feeCeiling = resolveStellarFeeCeiling({
+      feeProfile,
+      maxTransactionFeeStroops,
+      warmCapStroops,
+      coldCapStroops,
+    });
+    this.maxTransactionFeeStroops = feeCeiling.capStroops;
+    this.feeProfile = feeCeiling.feeProfile;
+    this.policyContracts = normalizePolicyContracts(policyContracts);
+    this.policyEventTopics = normalizePolicyEventTopics(policyEventTopics);
+    this.policyContractSet = new Set(this.policyContracts);
+    this.policyEventTopicSet = new Set(this.policyEventTopics);
     this.inclusionFeeStroops = inclusionFeeStroops ?? Number(BASE_FEE);
     this.selectSigner = selectSigner ?? roundRobinSelectSigner();
     this.feeBumpSigner = feeBumpSigner;
@@ -168,13 +213,21 @@ export class ExactStellarScheme implements SchemeNetworkFacilitator {
    * Get mechanism-specific extra data for the supported kinds endpoint.
    * For Stellar, returns `areFeesSponsored` indicating to clients if they can expect fees to be sponsored.
    * As of now, the spec only supports `areFeesSponsored: true`.
+   * Also publishes the active fee ceiling so a client can compare a simulated fee
+   * before submitting. Policy allowlist fields are included only when configured.
    *
    * @param _ - The network identifier (unused, offset is network-agnostic)
-   * @returns Extra data with the `areFeesSponsored` flag
+   * @returns Extra data with the `areFeesSponsored` flag and the fee ceiling
    */
   getExtra(_: Network): Record<string, unknown> | undefined {
     return {
       areFeesSponsored: this.areFeesSponsored,
+      maxTransactionFeeStroops: this.maxTransactionFeeStroops,
+      ...(this.feeProfile !== undefined && { feeProfile: this.feeProfile }),
+      ...(this.policyContracts.length > 0 && {
+        policyEventContracts: [...this.policyContracts],
+        policyEventTopics: [...this.policyEventTopics],
+      }),
     };
   }
 
@@ -637,6 +690,10 @@ export class ExactStellarScheme implements SchemeNetworkFacilitator {
    * expected sender, recipient, amount, and asset (contract address), and the
    * facilitator address is not involved in the transfer.
    *
+   * With no policy allowlist, every contract event must be that transfer.
+   * When `policyContracts` is set, non-balance-moving events from those
+   * contracts are skipped first. Balance-moving topics stay on this scan.
+   *
    * @param events - The array of DiagnosticEvent objects from the simulation
    * @param fromAddress - The payer's address
    * @param toAddress - The recipient's address
@@ -667,6 +724,23 @@ export class ExactStellarScheme implements SchemeNetworkFacilitator {
         // Skip non-contract events
         if (event.type().name !== "contract") {
           continue;
+        }
+
+        // Opt-in: drop allowlisted policy events. An empty allowlist keeps the
+        // strict scan below, so existing verifications are unchanged.
+        if (this.policyContractSet.size > 0) {
+          const decision = gatePolicyContractEvent(
+            event,
+            expectedAsset,
+            this.policyContractSet,
+            this.policyEventTopicSet,
+          );
+          if (decision.action === "skip") {
+            continue;
+          }
+          if (decision.action === "reject") {
+            return invalidVerifyResponse(decision.reason, fromAddress, decision.message);
+          }
         }
 
         const body = event.body().v0();

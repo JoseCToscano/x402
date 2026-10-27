@@ -1,5 +1,11 @@
+import { Address } from "@stellar/stellar-sdk";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { STELLAR_TESTNET_CAIP2 } from "../../src/constants";
+import {
+  DEFAULT_COLD_FEE_CAP_STROOPS,
+  DEFAULT_MAX_TRANSACTION_FEE_STROOPS,
+  DEFAULT_WARM_FEE_CAP_STROOPS,
+} from "../../src/exact/facilitator/policy";
 import { ExactStellarScheme } from "../../src/exact/facilitator/scheme";
 import { createEd25519Signer } from "../../src/signer";
 import * as stellarUtils from "../../src/utils";
@@ -33,7 +39,10 @@ describe("ExactStellarScheme - getExtra", () => {
 
     const result = scheme.getExtra(STELLAR_TESTNET_CAIP2);
 
-    expect(result).toEqual({ areFeesSponsored: true });
+    expect(result).toEqual({
+      areFeesSponsored: true,
+      maxTransactionFeeStroops: DEFAULT_MAX_TRANSACTION_FEE_STROOPS,
+    });
     expect(mockRpcClient.getLatestLedger).not.toHaveBeenCalled();
   });
 
@@ -46,10 +55,16 @@ describe("ExactStellarScheme - getExtra", () => {
     scheme = new ExactStellarScheme([signer]);
 
     const result1 = scheme.getExtra(STELLAR_TESTNET_CAIP2);
-    expect(result1).toEqual({ areFeesSponsored: true });
+    expect(result1).toEqual({
+      areFeesSponsored: true,
+      maxTransactionFeeStroops: DEFAULT_MAX_TRANSACTION_FEE_STROOPS,
+    });
 
     const result2 = scheme.getExtra(STELLAR_TESTNET_CAIP2);
-    expect(result2).toEqual({ areFeesSponsored: true });
+    expect(result2).toEqual({
+      areFeesSponsored: true,
+      maxTransactionFeeStroops: DEFAULT_MAX_TRANSACTION_FEE_STROOPS,
+    });
 
     expect(mockRpcClient.getLatestLedger).not.toHaveBeenCalled();
   });
@@ -63,7 +78,10 @@ describe("ExactStellarScheme - getExtra", () => {
     scheme = new ExactStellarScheme([signer], { areFeesSponsored: false });
 
     const result = scheme.getExtra(STELLAR_TESTNET_CAIP2);
-    expect(result).toEqual({ areFeesSponsored: false });
+    expect(result).toEqual({
+      areFeesSponsored: false,
+      maxTransactionFeeStroops: DEFAULT_MAX_TRANSACTION_FEE_STROOPS,
+    });
   });
 
   it("should return consistent areFeesSponsored with multiple signers", () => {
@@ -81,10 +99,67 @@ describe("ExactStellarScheme - getExtra", () => {
     // Call getExtra multiple times to ensure consistency
     for (let i = 0; i < 10; i++) {
       const result = scheme.getExtra(STELLAR_TESTNET_CAIP2);
-      expect(result).toEqual({ areFeesSponsored: true });
+      expect(result).toEqual({
+        areFeesSponsored: true,
+        maxTransactionFeeStroops: DEFAULT_MAX_TRANSACTION_FEE_STROOPS,
+      });
     }
 
     expect(mockRpcClient.getLatestLedger).not.toHaveBeenCalled();
+  });
+
+  it("publishes a fee profile, an explicit ceiling, and the policy allowlist", () => {
+    const signer = createEd25519Signer(
+      "SDV3OZOPGIO6GQAVI7T6ZJ7NSNFB26JX6QZYCI64TBC7BAZY6FQVAXXK",
+      STELLAR_TESTNET_CAIP2,
+    );
+    const policy = Address.contract(Buffer.alloc(32, 7)).toString();
+
+    const warm = new ExactStellarScheme([signer], {
+      feeProfile: "warm",
+      policyContracts: [policy, ` ${policy}`],
+      policyEventTopics: ["spending_limit_enforced"],
+    });
+    expect(warm.maxTransactionFeeStroops).toBe(DEFAULT_WARM_FEE_CAP_STROOPS);
+    expect(warm.getExtra(STELLAR_TESTNET_CAIP2)).toEqual({
+      areFeesSponsored: true,
+      feeProfile: "warm",
+      maxTransactionFeeStroops: DEFAULT_WARM_FEE_CAP_STROOPS,
+      policyEventContracts: [policy],
+      policyEventTopics: ["spending_limit_enforced"],
+    });
+
+    const overridden = new ExactStellarScheme([signer], {
+      feeProfile: "warm",
+      maxTransactionFeeStroops: 123_456,
+    });
+    expect(overridden.feeProfile).toBe("warm");
+    expect(overridden.maxTransactionFeeStroops).toBe(123_456);
+    expect(overridden.getExtra(STELLAR_TESTNET_CAIP2)).toMatchObject({
+      feeProfile: "warm",
+      maxTransactionFeeStroops: 123_456,
+    });
+
+    const cold = new ExactStellarScheme([signer], { feeProfile: "cold" });
+    expect(cold.maxTransactionFeeStroops).toBe(DEFAULT_COLD_FEE_CAP_STROOPS);
+    expect(cold.getExtra(STELLAR_TESTNET_CAIP2)).not.toHaveProperty("policyEventContracts");
+  });
+
+  it("rejects a balance-moving topic and a contract id that is not a C address", () => {
+    const signer = createEd25519Signer(
+      "SDV3OZOPGIO6GQAVI7T6ZJ7NSNFB26JX6QZYCI64TBC7BAZY6FQVAXXK",
+      STELLAR_TESTNET_CAIP2,
+    );
+
+    expect(() => new ExactStellarScheme([signer], { policyEventTopics: ["transfer"] })).toThrow(
+      /balance-moving/,
+    );
+    expect(() => new ExactStellarScheme([signer], { policyEventTopics: ["Approve"] })).toThrow(
+      /balance-moving/,
+    );
+    expect(() => new ExactStellarScheme([signer], { policyContracts: ["not-a-contract"] })).toThrow(
+      /not a Stellar contract address/,
+    );
   });
 });
 

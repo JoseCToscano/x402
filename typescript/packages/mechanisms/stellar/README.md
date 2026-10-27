@@ -40,7 +40,7 @@ This package provides three main components for handling x402 payments on Stella
 - `FacilitatorStellarSigner` - TypeScript type for facilitator signers
 
 > [!NOTE]
-> Facilitators currently always sponsor transaction fees (`areFeesSponsored: true`). Settlement fees are derived from the settle-time simulation (`simulationResourceFee + inclusionBuffer`); `maxTransactionFeeStroops` is a safety ceiling, not a per-transaction budget. A non-sponsored flow will be added later. See [spec](../../../specs/schemes/exact/scheme_exact_stellar.md#paymentrequirements-for-exact) for details.
+> Facilitators currently always sponsor transaction fees (`areFeesSponsored: true`). Settlement fees are derived from the settle-time simulation (`simulationResourceFee + inclusionBuffer`); `maxTransactionFeeStroops` is a safety ceiling, not a per-transaction budget. The default ceiling is 50,000 stroops. `feeProfile: "warm"` (500,000) or `"cold"` (6,500,000) opts into a higher ceiling for Soroban smart accounts. `getExtra` publishes the active ceiling. A non-sponsored flow will be added later. See [spec](../../../specs/schemes/exact/scheme_exact_stellar.md#paymentrequirements-for-exact) for details.
 
 **Server:**
 
@@ -121,6 +121,14 @@ const facilitator = new x402Facilitator().register(
   "stellar:testnet",
   new ExactStellarScheme([signer]),
 );
+
+// Facilitator scheme (`@x402/stellar/exact/facilitator`). Opt-in for smart accounts.
+// Balance-moving topics stay rejected.
+const smartAccountFacilitator = new ExactStellarScheme([signer], {
+  feeProfile: "warm",
+  policyContracts: ["CAP53MP7CWG3TTOQNMICVSNIBFMNEE7HYNOK4O2OP3FVBBB4YK6UAZP6"],
+  policyEventTopics: ["spending_limit_enforced"],
+});
 ```
 
 ## Development
